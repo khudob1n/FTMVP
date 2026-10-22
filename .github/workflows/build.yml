@@ -1,0 +1,213 @@
+name: Build FTMVP APK
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+      - name: Generate Android project
+        shell: bash
+        run: |
+          mkdir -p app/src/main/java/com/example/ftmvp
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }
+          rootProject.name = "FTMVP"
+          include(":app")
+          EOF
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.7.3" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+          }
+          EOF
+          echo 'org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8' > gradle.properties
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.ftmvp"
+              compileSdk = 35
+              defaultConfig {
+                  applicationId = "com.example.ftmvp"
+                  minSdk = 26
+                  targetSdk = 35
+                  versionCode = 1
+                  versionName = "0.1"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application android:label="FTMVP" android:allowBackup="false" android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".BankNotificationService"
+                      android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE"
+                      android:exported="false">
+                      <intent-filter>
+                          <action android:name="android.service.notification.NotificationListenerService"/>
+                      </intent-filter>
+                  </service>
+              </application>
+          </manifest>
+          EOF
+          cat > app/src/main/java/com/example/ftmvp/Db.kt <<'EOF'
+          package com.example.ftmvp
+          import android.content.Context
+          import android.database.sqlite.SQLiteDatabase
+          import android.database.sqlite.SQLiteOpenHelper
+          import android.content.ContentValues
+
+          class Db(ctx: Context): SQLiteOpenHelper(ctx,"finance.db",null,1) {
+              override fun onCreate(db: SQLiteDatabase) {
+                  db.execSQL("CREATE TABLE tx(id INTEGER PRIMARY KEY, fingerprint TEXT UNIQUE, bank TEXT, amount INTEGER, description TEXT)")
+              }
+              override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {}
+              fun add(key: String, bank: String, amount: Long, description: String) {
+                  val v=ContentValues().apply {
+                      put("fingerprint",key)
+                      put("bank",bank)
+                      put("amount",amount)
+                      put("description",description)
+                  }
+                  writableDatabase.insertWithOnConflict("tx",null,v,SQLiteDatabase.CONFLICT_IGNORE)
+              }
+          }
+          EOF
+          cat > app/src/main/java/com/example/ftmvp/BankNotificationService.kt <<'EOF'
+          package com.example.ftmvp
+          import android.service.notification.NotificationListenerService
+          import android.service.notification.StatusBarNotification
+          import android.app.Notification
+          import java.math.BigDecimal
+          import java.security.MessageDigest
+
+          class BankNotificationService: NotificationListenerService() {
+              override fun onNotificationPosted(sbn: StatusBarNotification?) {
+                  if(sbn==null) return
+                  val bank=when(sbn.packageName) {
+                      "ru.sberbankmobile" -> "Сбер"
+                      "com.idamob.tinkoff.android" -> "Т-Банк"
+                      "ru.alfabank.mobile.android" -> "Альфа"
+                      "ru.yandex.bank" -> "Яндекс"
+                      else -> return
+                  }
+                  val extras=sbn.notification.extras
+                  val s=(extras.getCharSequence(Notification.EXTRA_TITLE)?.toString().orEmpty()+" "+
+                      extras.getCharSequence(Notification.EXTRA_TEXT)?.toString().orEmpty()).trim()
+                  val lower=s.lowercase()
+                  val expense=Regex("оплата|покупка|списание|потрачено").containsMatchIn(lower)
+                  val income=Regex("поступление|зачисление|пополнение").containsMatchIn(lower)
+                  if(expense==income || Regex("отмена|возврат|перевод|отклонен").containsMatchIn(lower)) return
+                  val re=Regex("""(\d[\d \u00a0\u202f]*)(?:[.,](\d{1,2}))?\s*(?:₽|руб\.?|RUB)""",RegexOption.IGNORE_CASE)
+                  val m=re.findAll(s).toList().singleOrNull()?:return
+                  val whole=m.groupValues[1].filter { it.isDigit() }
+                  val fraction=m.groupValues[2].ifEmpty { "00" }.padEnd(2,'0')
+                  val amount=try {
+                      BigDecimal(whole+"."+fraction).movePointRight(2).longValueExact()
+                  } catch(e: Exception) { return }
+                  if(amount<=0) return
+                  val bytes=MessageDigest.getInstance("SHA-256").digest((sbn.packageName+sbn.key+s).toByteArray())
+                  val key=bytes.joinToString("") { "%02x".format(it) }
+                  Db(applicationContext).use { it.add(key,bank,if(expense) -amount else amount,s.take(150)) }
+              }
+          }
+          EOF
+          cat > app/src/main/java/com/example/ftmvp/MainActivity.kt <<'EOF'
+          package com.example.ftmvp
+          import android.app.Activity
+          import android.os.Bundle
+          import android.content.Intent
+          import android.provider.Settings
+          import android.widget.*
+          import java.util.Locale
+
+          class MainActivity: Activity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  draw()
+              }
+              override fun onResume() {
+                  super.onResume()
+                  draw()
+              }
+              private fun draw() {
+                  val root=LinearLayout(this).apply {
+                      orientation=LinearLayout.VERTICAL
+                      setPadding(32,48,32,32)
+                  }
+                  val scroll=ScrollView(this)
+                  scroll.addView(root)
+                  setContentView(scroll)
+                  fun label(s: String) {
+                      root.addView(TextView(this).apply {
+                          text=s
+                          textSize=19f
+                          setPadding(0,10,0,10)
+                      })
+                  }
+                  label("FTMVP — Мои финансы")
+                  root.addView(Button(this).apply {
+                      text="Разрешить доступ к уведомлениям"
+                      setOnClickListener {
+                          startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+                      }
+                  })
+                  val rows=mutableListOf<String>()
+                  var income=0L
+                  var expense=0L
+                  Db(this).use { helper ->
+                      helper.readableDatabase.rawQuery(
+                          "SELECT bank,amount,description FROM tx ORDER BY id DESC LIMIT 100",null
+                      ).use { c ->
+                          while(c.moveToNext()) {
+                              val bank=c.getString(0)
+                              val amount=c.getLong(1)
+                              val description=c.getString(2)
+                              if(amount>0) income+=amount else expense-=amount
+                              rows.add("$bank | "+String.format(Locale.ROOT,"%.2f",amount/100.0)+" ₽ | "+description)
+                          }
+                      }
+                  }
+                  label("Доходы: "+String.format(Locale.ROOT,"%.2f",income/100.0)+" ₽")
+                  label("Расходы: "+String.format(Locale.ROOT,"%.2f",expense/100.0)+" ₽")
+                  label("Разница не равна банковскому балансу")
+                  rows.forEach { label(it) }
+                  root.addView(Button(this).apply {
+                      text="Обновить"
+                      setOnClickListener { draw() }
+                  })
+              }
+          }
+          EOF
+      - name: Build APK
+        run: gradle --no-daemon assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FTMVP-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
